@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import io
+import os
 import time
 import shutil
 import tempfile
@@ -17,7 +18,9 @@ from pdf_contracts import (
     calc_quality,
 )
 
-APP_TITLE = "📄 تحويل عقود PDF إلى Excel (قوي + تقرير)"
+from ai_assist import ai_fill_missing_fields, merge_row_with_ai
+
+APP_TITLE = "📄 تحويل عقود PDF إلى Excel (قوي + وكيل Perplexity + تقرير)"
 OUTPUT_FILE_NAME = "Employees_Data.xlsx"
 SHEET_MAIN = "الموظفين"
 SHEET_LOGS = "Logs"
@@ -27,7 +30,7 @@ st.title(APP_TITLE)
 
 st.write(
     "ارفع ملفات PDF (أي عدد). يتم استخراج البيانات ووضع كل موظف في سطر واحد داخل Excel.\n"
-    "أي حقل غير موجود في العقد سيبقى فارغ. وإذا ملف واحد فيه مشكلة، العملية تكمل للباقي."
+    "الآن يوجد وكيل Perplexity اختياري لتعبئة الحقول الناقصة مع أدلة وثقة."
 )
 
 with st.expander("⚙️ إعدادات", expanded=False):
@@ -40,6 +43,13 @@ with st.expander("⚙️ إعدادات", expanded=False):
         show_quality_table = st.checkbox("عرض جدول جودة الاستخراج", value=True)
     with c4:
         cleanup_delay = st.slider("ثواني قبل تنظيف الملفات المؤقتة", 0, 8, 2)
+
+with st.expander("🤖 إعدادات الوكيل (Perplexity)", expanded=True):
+    use_ai = st.checkbox("تشغيل الوكيل (يعبّي الحقول الناقصة بالذكاء)", value=True)
+    model = st.selectbox("Model", ["sonar-pro", "sonar"], index=0)
+    only_fill_empty = st.checkbox("الذكاء يعبّي الفاضي فقط (لا يغيّر قيم موجودة)", value=True)
+    min_quality_before_ai = st.slider("لو الجودة أقل من هذا الرقم، شغّل الذكاء", 0, 100, 85)
+    max_chars_to_ai = st.slider("حد أقصى لنص العقد المرسل للذكاء (حماية)", 5000, 40000, 22000, step=1000)
 
 uploaded = st.file_uploader("ارفع ملفات PDF هنا", type=["pdf"], accept_multiple_files=True)
 
@@ -79,10 +89,10 @@ def build_excel_bytes(rows, logs=None, include_logs=True):
         ws2 = wb.create_sheet(SHEET_LOGS)
         ws2.append([
             "timestamp", "file_name", "status",
-            "filled_fields", "total_fields", "quality_%", "missing_fields",
-            "note"
+            "filled_fields", "total_fields", "quality_%", "ai_filled",
+            "missing_fields", "note"
         ])
-        for c in range(1, 9):
+        for c in range(1, 10):
             cell = ws2.cell(row=1, column=c)
             cell.font = Font(bold=True)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -96,12 +106,13 @@ def build_excel_bytes(rows, logs=None, include_logs=True):
                     item.get("filled_fields",""),
                     item.get("total_fields",""),
                     item.get("quality_pct",""),
+                    item.get("ai_filled",""),
                     item.get("missing_fields",""),
                     item.get("note",""),
                 ])
 
         ws2.freeze_panes = "A2"
-        for row_cells in ws2.iter_rows(min_row=2, max_row=ws2.max_row, max_col=8):
+        for row_cells in ws2.iter_rows(min_row=2, max_row=ws2.max_row, max_col=9):
             for cell in row_cells:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
 
@@ -123,6 +134,8 @@ def process_files(files):
     debug_items = []
     report_lines = []
 
+    api_key = os.getenv("PERPLEXITY_API_KEY", "")
+
     total_files = len(files)
     progress = st.progress(0)
     status = st.empty()
@@ -130,6 +143,8 @@ def process_files(files):
     for i, f in enumerate(files, start=1):
         status.write(f"جارٍ معالجة الملف {i}/{total_files}: **{f.name}**")
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        ai_filled = 0
 
         try:
             pdf_bytes = f.read()
@@ -145,21 +160,54 @@ def process_files(files):
                     "filled_fields": filled,
                     "total_fields": total,
                     "quality_pct": pct,
+                    "ai_filled": ai_filled,
                     "missing_fields": ", ".join(missing[:10]) + (" ..." if len(missing) > 10 else ""),
                     "note": "File empty/too small"
                 })
-
                 report_lines.append(f"- {f.name}: SKIPPED (empty)")
                 debug_items.append({"file": f.name, "raw": "", "norm": "", "note": "empty"})
             else:
                 raw_text, norm_text = extract_raw_and_normalized_text(pdf_bytes)
+
+                # 1) rule-based
                 data = parse_contract(norm_text) or {}
                 row = {h: (data.get(h, "") if data.get(h, "") is not None else "") for h in HEADERS}
-
                 filled, total, pct, missing = calc_quality(row)
 
+                # 2) AI assist if needed
+                ai_note = ""
+                if use_ai and missing and pct < float(min_quality_before_ai):
+                    ai = ai_fill_missing_fields(
+                        api_key=api_key,
+                        model=model,
+                        normalized_text=norm_text,
+                        missing_fields=missing,
+                        headers_all=HEADERS,
+                        max_chars=int(max_chars_to_ai),
+                        temperature=0.0,
+                        retry=2,
+                    )
+                    if ai.error:
+                        ai_note = f"AI_ERROR: {ai.error}"
+                    else:
+                        row, ai_filled = merge_row_with_ai(row, ai, only_fill_empty=only_fill_empty)
+                        filled, total, pct, missing = calc_quality(row)
+                        ai_note = f"AI filled {ai_filled} fields"
+
+                        # attach evidence to debug (optional)
+                        if enable_debug:
+                            ev_preview = "\n".join([f"{k}: {v}" for k, v in list(ai.evidence.items())[:20]])
+                            debug_items.append({
+                                "file": f.name,
+                                "raw": safe_lines(raw_text, 60),
+                                "norm": safe_lines(norm_text, 120),
+                                "note": f"After AI: {pct}% | {ai_note}\nEvidence:\n{ev_preview}"
+                            })
+
                 status_label = "OK" if pct >= 35 else "LOW_QUALITY"
-                note = "Parsed successfully" if status_label == "OK" else "Low filled fields; check Debug text"
+                note = "Parsed" if status_label == "OK" else "Low quality; check Debug"
+                if ai_note:
+                    note = note + " | " + ai_note
 
                 rows.append(row)
                 logs.append({
@@ -169,16 +217,17 @@ def process_files(files):
                     "filled_fields": filled,
                     "total_fields": total,
                     "quality_pct": pct,
+                    "ai_filled": ai_filled,
                     "missing_fields": ", ".join(missing[:10]) + (" ..." if len(missing) > 10 else ""),
                     "note": note
                 })
 
-                report_lines.append(f"- {f.name}: {status_label} | Quality {pct}% | Missing {len(missing)} fields")
+                report_lines.append(f"- {f.name}: {status_label} | Quality {pct}% | AI filled {ai_filled} | Missing {len(missing)}")
 
-                if enable_debug:
+                if enable_debug and not ai_note:
                     debug_items.append({
                         "file": f.name,
-                        "raw": safe_lines(raw_text, 80),
+                        "raw": safe_lines(raw_text, 60),
                         "norm": safe_lines(norm_text, 120),
                         "note": f"Quality {pct}%"
                     })
@@ -186,7 +235,6 @@ def process_files(files):
         except Exception as e:
             row = {h: "" for h in HEADERS}
             filled, total, pct, missing = calc_quality(row)
-
             rows.append(row)
             logs.append({
                 "timestamp": ts,
@@ -195,6 +243,7 @@ def process_files(files):
                 "filled_fields": filled,
                 "total_fields": total,
                 "quality_pct": pct,
+                "ai_filled": ai_filled,
                 "missing_fields": ", ".join(missing[:10]) + (" ..." if len(missing) > 10 else ""),
                 "note": f"{type(e).__name__}: {str(e)}"
             })
@@ -224,7 +273,7 @@ if run:
                 st.write(
                     f"- **{item['file_name']}** | Status: `{item['status']}` | "
                     f"Filled: {item['filled_fields']}/{item['total_fields']} | "
-                    f"Quality: **{item['quality_pct']}%** | Missing: {item['missing_fields']}"
+                    f"Quality: **{item['quality_pct']}%** | AI filled: **{item['ai_filled']}** | Missing: {item['missing_fields']}"
                 )
 
         excel_bytes = build_excel_bytes(rows, logs=logs, include_logs=include_logs_sheet)
@@ -245,12 +294,13 @@ if run:
         )
 
         if enable_debug:
-            st.subheader("🧪 Debug لكل ملف (خام + بعد التطبيع)")
-            st.caption("لو حقل ما يطلع، افتح الملف وشوف النص بعد التطبيع — هذا هو اللي نعتمد عليه في الاستخراج.")
+            st.subheader("🧪 Debug لكل ملف (خام + بعد التطبيع + أدلة AI)")
             for d in debug_items:
-                with st.expander(f"📄 {d['file']} — {d['note']}", expanded=False):
-                    st.text_area("RAW (first 80 lines)", d.get("raw",""), height=210)
-                    st.text_area("NORMALIZED (first 120 lines)", d.get("norm",""), height=260)
+                with st.expander(f"📄 {d['file']} — {d['note'][:120]}", expanded=False):
+                    st.text_area("RAW (first 60 lines)", d.get("raw",""), height=200)
+                    st.text_area("NORMALIZED (first 120 lines)", d.get("norm",""), height=280)
+                    if "Evidence:" in d.get("note",""):
+                        st.text_area("AI Evidence Preview", d.get("note",""), height=220)
 
         st.info("🧹 سيتم حذف الملفات المؤقتة تلقائيًا.")
         time.sleep(int(cleanup_delay))
