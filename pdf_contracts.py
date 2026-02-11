@@ -33,39 +33,6 @@ def digits_only(s: str) -> str:
         return ""
     return "".join(re.findall(r"\d+", str(s)))
 
-def clean_amount_to_int(s: str) -> str:
-    """
-    2,000.00 -> 2000
-    """
-    if not s:
-        return ""
-    m = re.search(r"(\d[\d,]*)(?:\.\d+)?", str(s))
-    if not m:
-        return ""
-    return m.group(1).replace(",", "")
-
-def format_date_any(s: str) -> str:
-    """
-    Accepts: YYYY-MM-DD / DD-MM-YYYY / YYYY/MM/DD / DD/MM/YYYY
-    Returns: DD/MM/YYYY
-    """
-    if not s:
-        return ""
-    s = str(s).strip()
-    m = re.search(r"(\d{1,4})[-/](\d{1,2})[-/](\d{1,4})", s)
-    if not m:
-        return ""
-    a, b, c = m.group(1), m.group(2), m.group(3)
-    if len(a) == 4:
-        year = int(a); month = int(b); day = int(c)
-    else:
-        day = int(a); month = int(b); year = int(c)
-        if year < 100:
-            year += 2000
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return ""
-    return f"{day:02d}/{month:02d}/{year:04d}"
-
 def ar_count(s: str) -> int:
     return len(AR_RE.findall(s or ""))
 
@@ -77,8 +44,7 @@ def dig_count(s: str) -> int:
 
 def fix_rtl_value(v: str) -> str:
     """
-    Fix value strings that come reversed (Arabic text),
-    but keep emails/latin/numbers as-is.
+    Fix Arabic values that come reversed. Keep latin/emails/numbers.
     """
     if not v:
         return ""
@@ -91,20 +57,94 @@ def fix_rtl_value(v: str) -> str:
         return v[::-1]
     return v
 
+def clean_amount_to_int(s: str) -> str:
+    """
+    Extract integer-like numeric string:
+      9,720.00 -> 9720
+      9720 -> 9720
+      00.027,9 (bad) won't be handled here; we normalize first.
+    """
+    if not s:
+        return ""
+    m = re.search(r"(\d[\d,]*)(?:\.\d+)?", str(s))
+    if not m:
+        return ""
+    return m.group(1).replace(",", "")
+
+def normalize_reversed_short_number(token: str) -> str:
+    """
+    Fix short reversed numbers like 09 -> 90, 03 -> 30, 05 -> 50
+    """
+    token = (token or "").strip()
+    if re.fullmatch(r"0\d", token):
+        return token[::-1]
+    return token
+
+def normalize_amount_token(token: str) -> str:
+    """
+    Fix reversed amount tokens seen in Qiwa extraction:
+      '00.027,9' -> reverse -> '9,720.00' -> 9720
+      '00.026,1' -> '1,620.00' -> 1620
+      '00.018'   -> '810.00' -> 810
+    """
+    if not token:
+        return ""
+    t = token.strip()
+
+    if t.startswith("00.") and ("," in t):
+        t = t[::-1]
+    elif t.startswith("00.") and ("," not in t):
+        t = t[::-1]
+
+    return clean_amount_to_int(t)
+
+def format_date_any(s: str) -> str:
+    """
+    Accepts: YYYY-MM-DD / DD-MM-YYYY / YYYY/MM/DD / DD/MM/YYYY
+    Fixes reversed year cases: 20-21-3202 -> 20-12-2023 (year reversed)
+    Returns: DD/MM/YYYY
+    """
+    if not s:
+        return ""
+    s = str(s).strip()
+
+    m = re.search(r"(\d{1,4})[-/](\d{1,2})[-/](\d{1,4})", s)
+    if not m:
+        return ""
+
+    a, b, c = m.group(1), m.group(2), m.group(3)
+
+    # If year seems reversed (e.g. 3202 / 5202 / 6202)
+    if len(c) == 4:
+        y = int(c)
+        if y > 2100:
+            c = c[::-1]
+
+    if len(a) == 4:
+        year = int(a); month = int(b); day = int(c)
+    else:
+        day = int(a); month = int(b); year = int(c)
+        if year < 100:
+            year += 2000
+
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return ""
+
+    return f"{day:02d}/{month:02d}/{year:04d}"
+
 # =======================
 #  RTL Normalization (STRONG)
 # =======================
 def smart_normalize_line(line: str) -> str:
     """
-    Converts:
-      22477445 :دقعلا مقر   ->  رقم العقد: 22477445
-      NAME :مسلاا          ->  االسم: NAME
+    Converts value:reversed-label into label:value
+      22477445 :دقعلا مقر -> رقم العقد: 22477445
+      NAME :مسلاا -> االسم: NAME
     """
     line = (line or "").strip()
     if not line:
         return ""
 
-    # remove weird leading colon
     if line.startswith(":") and line.count(":") == 1:
         line = line[1:].strip()
 
@@ -115,13 +155,13 @@ def smart_normalize_line(line: str) -> str:
     left = left.strip()
     right = right.strip()
 
-    # Heuristic: if right looks like reversed Arabic label -> reverse it and swap
+    # right is reversed arabic label
     if ar_count(right) > 0 and lat_count(right) == 0 and dig_count(right) < 3:
         label = right[::-1].strip()
         value = left.strip()
         return f"{label}: {value}"
 
-    # Or if left looks like reversed Arabic label
+    # left is reversed arabic label
     if ar_count(left) > 0 and lat_count(left) == 0 and dig_count(left) < 3:
         label = left[::-1].strip()
         value = right.strip()
@@ -131,16 +171,13 @@ def smart_normalize_line(line: str) -> str:
 
 def maybe_reverse_sentence(line: str) -> str:
     """
-    For non label/value lines (no colon):
-    If mostly Arabic, reverse the whole line to fix RTL extraction
-    (this is what unlocks: start/end/join/duration/salary/workdays/hours/etc.)
+    For non label/value lines, reverse if Arabic dominates (fixes: dates/amounts/percent in sentences).
     """
     s = (line or "").strip()
     if not s:
         return ""
     if ":" in s:
         return s
-    # if Arabic dominates and line is long enough, reverse it
     ar = ar_count(s)
     la = lat_count(s)
     if ar >= 10 and ar > la:
@@ -160,13 +197,19 @@ def normalize_contract_text(raw_text: str) -> str:
 # =======================
 #  PDF Extraction
 # =======================
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+def extract_raw_and_normalized_text(pdf_bytes: bytes) -> tuple[str, str]:
     parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             parts.append(normalize_text(page.extract_text() or ""))
     raw = "\n".join(parts)
-    return normalize_contract_text(raw)
+    normalized = normalize_contract_text(raw)
+    return raw, normalized
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    # keep old interface
+    _, normalized = extract_raw_and_normalized_text(pdf_bytes)
+    return normalized
 
 # =======================
 #  Getters
@@ -190,11 +233,10 @@ def find_line_containing(text: str, keyword: str) -> str:
 
 def normalize_mobile_from_line(line: str) -> str:
     """
-    Input examples:
-      رقم الجوال: 966 0590728938
-      رقم الجوال: 9660550266101
+    Input:
+      رقم الجوال: 966 0505606061
     Output:
-      966590728938 (remove spaces, remove 0 after 966)
+      966505606061 (remove spaces + remove 0 after 966)
     """
     if not line:
         return ""
@@ -221,8 +263,22 @@ def normalize_mobile_from_line(line: str) -> str:
         joined = "966" + joined[4:]
     return joined
 
+def evidence_snip(text: str, pattern: str, max_len=140) -> str:
+    """
+    Small snippet for logs: show where we matched from.
+    """
+    try:
+        m = re.search(pattern, text)
+        if not m:
+            return ""
+        s = m.start()
+        e = min(len(text), s + max_len)
+        return text[s:e].replace("\n", " ")
+    except Exception:
+        return ""
+
 # =======================
-#  Parser
+#  Parser (Strong + Fixers)
 # =======================
 def parse_contract(text: str) -> dict:
     out = {h: "" for h in HEADERS}
@@ -234,21 +290,18 @@ def parse_contract(text: str) -> dict:
     if m:
         out["رقم العقد"] = m.group(1)
 
-    # ---- Contract date (strong) ----
-    # 1) "في يوم (2024-09-21)"
-    m = re.search(r"في يوم.*?\(?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\s*\)?", text)
+    # ---- Contract date ----
+    m = re.search(r"في يوم.*?\(?\s*([0-9]{2,4}[-/][0-9]{1,2}[-/][0-9]{2,4})\s*\)?", text)
     if m:
         out["تاريخ العقد"] = format_date_any(m.group(1))
-    else:
-        # 2) any (YYYY-MM-DD) near header
+    if not out["تاريخ العقد"]:
         m = re.search(r"\(\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\s*\)", text)
         if m:
             out["تاريخ العقد"] = format_date_any(m.group(1))
-        else:
-            # 3) created/created by line "تم اإلنشاء ... بتاريخ 2024-09-21"
-            m = re.search(r"تم.*?بتاريخ\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})", text)
-            if m:
-                out["تاريخ العقد"] = format_date_any(m.group(1))
+    if not out["تاريخ العقد"]:
+        m = re.search(r"تم.*?بتاريخ\s*([0-9]{2,4}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
+        if m:
+            out["تاريخ العقد"] = format_date_any(m.group(1))
 
     # ---- Company ----
     out["شركة/مؤسسة"] = fix_rtl_value(get_bi(text, ["شركة/مؤسسة", "Corporation/Company"]))
@@ -258,27 +311,26 @@ def parse_contract(text: str) -> dict:
     out["عنوان الشركة"] = fix_rtl_value(get_bi(text, ["العنوان", "Address"]))
     out["مكان العمل"] = fix_rtl_value(get_bi(text, ["مكان العمل", "Work Location"]))
 
-    # ---- Emails (company then employee) ----
+    # emails: company then employee
     emails = EMAIL_RE.findall(text)
     if emails:
         out["بريد الشركة"] = emails[0]
         if len(emails) >= 2:
             out["بريد الموظف"] = emails[1]
 
-    # ---- Signatory + position (split strongly) ----
+    # ---- Signatory / Position ----
     sign_raw = get_value_after_label(text, "ويمثلها بالتوقيع")
-    sign_raw = fix_rtl_value(sign_raw)
+    sign_raw = fix_rtl_value(sign_raw).replace("هتفصب", "بصفته").strip()
     if sign_raw:
-        # split on بصفته with optional spaces
-        m = re.split(r"\s*بصفته\s*", sign_raw, maxsplit=1)
-        if len(m) == 2:
-            out["المسؤول الموقع"] = m[0].strip()
-            out["الصفة"] = m[1].strip()
+        parts = re.split(r"\s*بصفته\s*", sign_raw, maxsplit=1)
+        if len(parts) == 2:
+            out["المسؤول الموقع"] = parts[0].strip()
+            out["الصفة"] = parts[1].strip()
         else:
-            out["المسؤول الموقع"] = sign_raw.strip()
+            out["المسؤول الموقع"] = sign_raw
 
     # ---- Employee ----
-    out["اسم الموظف"] = get_bi(text, ["االسم", "الاسم", "Name"]).strip()
+    out["اسم الموظف"] = fix_rtl_value(get_bi(text, ["االسم", "الاسم", "Name"]).strip())
     out["المهنة"] = fix_rtl_value(get_bi(text, ["المهنة", "Profession"]))
     out["الرقم الوظيفي"] = digits_only(get_bi(text, ["الرقم الوظيفي", "Employee Number"]))
     out["الجنسية"] = fix_rtl_value(get_bi(text, ["الجنسية", "Nationality"]))
@@ -300,78 +352,98 @@ def parse_contract(text: str) -> dict:
     if mobile_line:
         out["رقم الجوال"] = normalize_mobile_from_line(mobile_line)
 
-    # =======================
-    #  Terms (now works after reversing sentences)
-    # =======================
-
-    # Duration: "مدة هذا العقد 1 سنة" OR "مدة هذا العقد 6 أشهر"
+    # ---- Terms ----
     m = re.search(r"مدة هذا العقد\s+(\d+)\s*(سنة|سنوات|شهر|أشهر)", text)
     if m:
-        out["مدة العقد"] = m.group(1)
+        out["مدة العقد"] = digits_only(m.group(1))
 
-    # Start/End: sometimes in same line
-    m = re.search(r"يبدأ\s*.*?من\s*تاريخ\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2}).*?وينتهي\s*.*?في\s*[,،]?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})", text)
+    # Start/End
+    m = re.search(
+        r"يبدأ\s*.*?من\s*تاريخ\s*([0-9]{2,4}[-/][0-9]{1,2}[-/][0-9]{2,4}).*?"
+        r"وينتهي\s*.*?في\s*[,،]?\s*([0-9]{2,4}[-/][0-9]{1,2}[-/][0-9]{2,4})",
+        text
+    )
     if m:
         out["بدء العقد"] = format_date_any(m.group(1))
         out["انتهاء العقد"] = format_date_any(m.group(2))
     else:
-        # or separately
-        m1 = re.search(r"يبدأ\s*.*?من\s*تاريخ\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})", text)
-        m2 = re.search(r"وينتهي\s*.*?في\s*[,،]?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})", text)
+        m1 = re.search(r"يبدأ\s*.*?من\s*تاريخ\s*([0-9]{2,4}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
+        m2 = re.search(r"وينتهي\s*.*?في\s*[,،]?\s*([0-9]{2,4}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
         if m1:
             out["بدء العقد"] = format_date_any(m1.group(1))
         if m2:
             out["انتهاء العقد"] = format_date_any(m2.group(1))
 
-    # Join date: "تاريخ مباشرة ... هو 2024-09-25"
-    m = re.search(r"تاريخ\s+مباشرة.*?(?:هو|:)?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})", text)
+    # Joining date
+    m = re.search(r"تاريخ\s+مباشرة.*?(?:هو|:)?\s*([0-9]{2,4}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
     if m:
         out["تاريخ المباشرة الفعلية"] = format_date_any(m.group(1))
 
-    # Trial: "فترة ... 90 يوم"
+    # Trial period (09 -> 90)
     m = re.search(r"فترة\s+.*?تجربة.*?مدتها\s*(\d+)\s*يوم", text)
     if m:
-        out["فترة التجربة"] = m.group(1)
+        t = m.group(1)
+        if len(t) == 2:
+            t = normalize_reversed_short_number(t)
+        out["فترة التجربة"] = digits_only(t)
 
-    # Work days/hours
-    m = re.search(r"أيام\s+العمل.*?ب\s*(\d+)\s*.*?أيام", text)
+    # Work days / hours
+    m = re.search(r"تحدد\s+أيام\s+العمل.*?ب\s*(\d+)\s*أيام", text)
     if m:
-        out["أيام العمل الأسبوعية"] = m.group(1)
+        out["أيام العمل الأسبوعية"] = digits_only(m.group(1))
 
-    m = re.search(r"ساعات\s+العمل.*?ب\s*(\d+)\s*.*?يومي", text)
+    m = re.search(r"تحدد\s+ساعات\s+العمل.*?ب\s*(\d+)\s*يومي", text)
     if m:
-        out["ساعات العمل اليومية"] = m.group(1)
+        out["ساعات العمل اليومية"] = digits_only(m.group(1))
 
-    # Overtime percent: 50
-    m = re.search(r"(?:٪|%|\bpercent\b)\s*([0-9]{1,3})\s*.*?أجره\s*الأساسي", text)
+    # Overtime percent (05 -> 50)
+    m = re.search(r"(?:٪|%)\s*([0-9]{1,3})", text)
     if m:
-        out["أجر الساعة الإضافية"] = m.group(1)
+        p = m.group(1)
+        if len(p) == 2:
+            p = normalize_reversed_short_number(p)
+        out["أجر الساعة الإضافية"] = digits_only(p)
 
-    # =======================
-    #  Money
-    # =======================
-    # Basic salary
-    m = re.search(r"أجر[ًًا]?\s*أساس[يىي]\s*قدره\s*([0-9][0-9,]*(?:\.[0-9]+)?)", text)
+    # ---- Money ----
+    m = re.search(r"أجر[ًًا]?\s*أساس[يىي]\s*قدره\s*([0-9][0-9\.,]+)", text)
     if m:
-        out["الراتب الأساسي"] = clean_amount_to_int(m.group(1))
+        out["الراتب الأساسي"] = normalize_amount_token(m.group(1))
 
-    # Housing allowance
-    m = re.search(r"أجر\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*ريال\s*سعودي\s*[,،]?\s*بدل\s*سكن", text)
+    m = re.search(r"أجر\s*([0-9][0-9\.,]+)\s*ريال\s*سعودي\s*[,،]?\s*بدل\s*سكن", text)
     if m:
-        out["بدل السكن"] = clean_amount_to_int(m.group(1))
+        out["بدل السكن"] = normalize_amount_token(m.group(1))
 
-    # Annual leave days
+    # Annual leave (03 -> 30)
     m = re.search(r"إجازة\s*سنوية\s*مدتها\s*(\d+)\s*يوم", text)
     if m:
-        out["الإجازة السنوية"] = m.group(1)
+        d = m.group(1)
+        if len(d) == 2:
+            d = normalize_reversed_short_number(d)
+        out["الإجازة السنوية"] = digits_only(d)
 
     # Termination compensation
-    m = re.search(r"تعويض[ًًا]?.*?قدره\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*ريال\s*سعودي", text)
+    m = re.search(r"تعويض[ًًا]?.*?قدره\s*([0-9][0-9\.,]+)\s*ريال\s*سعودي", text)
     if m:
-        out["التعويض عند الفسخ بدون سبب"] = clean_amount_to_int(m.group(1))
+        out["التعويض عند الفسخ بدون سبب"] = normalize_amount_token(m.group(1))
 
     # Final cleanup
     for k in list(out.keys()):
         out[k] = "" if out[k] is None else str(out[k]).strip()
 
     return out
+
+# =======================
+#  Report helpers for app
+# =======================
+def calc_quality(row: dict) -> tuple[int, int, float, list[str]]:
+    total = len(HEADERS)
+    missing = []
+    filled = 0
+    for h in HEADERS:
+        v = str(row.get(h, "")).strip()
+        if v:
+            filled += 1
+        else:
+            missing.append(h)
+    pct = round((filled / total) * 100, 1) if total else 0.0
+    return filled, total, pct, missing
