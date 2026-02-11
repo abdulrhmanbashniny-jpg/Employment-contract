@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 import re
+import io
 import unicodedata
 import pdfplumber
 
-ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
-LATIN_RE  = re.compile(r"[A-Za-z]")
-EMAIL_RE  = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-
+# ========= Columns =========
 HEADERS = [
     "رقم العقد","تاريخ العقد","شركة/مؤسسة","الرقم الوطني الموحد","رقم المنشأة","السجل التجاري","عنوان الشركة","مكان العمل",
     "بريد الشركة","المسؤول الموقع","الصفة","اسم الموظف","رقم الهوية","نوع الهوية","تاريخ الميلاد","تاريخ انتهاء الهوية",
@@ -16,21 +14,17 @@ HEADERS = [
     "التعويض عند الفسخ بدون سبب"
 ]
 
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+# ========= Helpers =========
 def normalize_text(t: str) -> str:
     t = unicodedata.normalize("NFKC", t or "")
     t = t.replace("\u200f", "").replace("\u200e", "")
     return t
 
-def extract_text_from_pdf_path(pdf_path: str) -> str:
-    parts = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            parts.append(normalize_text(page.extract_text() or ""))
-    return "\n".join(parts)
-
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     parts = []
-    with pdfplumber.open(pdf_bytes) as pdf:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             parts.append(normalize_text(page.extract_text() or ""))
     return "\n".join(parts)
@@ -40,43 +34,95 @@ def digits_only(s: str) -> str:
         return ""
     return "".join(re.findall(r"\d+", str(s)))
 
-def clean_amount(s: str) -> str:
+def clean_amount_to_int(s: str) -> str:
+    """
+    يرجّع رقم صحيح كنص: 2,000.00 -> 2000
+    """
     if not s:
         return ""
-    m = re.search(r"(\d[\d,]*)(?:\.\d+)?", s)
+    m = re.search(r"(\d[\d,]*)(?:\.\d+)?", str(s))
     if not m:
         return ""
     return m.group(1).replace(",", "")
 
-def format_date(s: str) -> str:
+def format_date_any(s: str) -> str:
+    """
+    يدعم: YYYY-MM-DD / DD-MM-YYYY / YYYY/MM/DD / DD/MM/YYYY
+    ويرجع: DD/MM/YYYY
+    """
     if not s:
         return ""
     s = str(s).strip()
-    m = re.search(r"(\d{2,4})[-/](\d{1,2})[-/](\d{1,2})", s)
+
+    m = re.search(r"(\d{1,4})[-/](\d{1,2})[-/](\d{1,4})", s)
     if not m:
         return ""
+
     a, b, c = m.group(1), m.group(2), m.group(3)
+
+    # إذا بدأت بـ 4 أرقام => Year first
     if len(a) == 4:
         year = int(a); month = int(b); day = int(c)
     else:
         day = int(a); month = int(b); year = int(c)
         if year < 100:
             year += 2000
+
     return f"{day:02d}/{month:02d}/{year:04d}"
 
-def normalize_mobile(text: str) -> str:
-    if not text:
-        return ""
-    raw = str(text)
-    raw_no_spaces = re.sub(r"\s+", "", raw)
+def get_value_after_label(text: str, label: str) -> str:
+    # label: value
+    m = re.search(rf"{re.escape(label)}\s*:\s*([^\n]+)", text)
+    return (m.group(1).strip() if m else "")
 
-    groups = re.findall(r"\d+", raw)
+def get_value_before_label(text: str, label: str) -> str:
+    # value : label  (مثل: email :البريد الإلكتروني)
+    m = re.search(rf"([^\n:]+)\s*:\s*{re.escape(label)}", text)
+    return (m.group(1).strip() if m else "")
+
+def get_bi(text: str, labels):
+    """
+    labels: قائمة احتمالات (بالعربي/الانجليزي) لنفس الحقل
+    يحاول label:value ثم value:label
+    """
+    for lab in labels:
+        v = get_value_after_label(text, lab)
+        if v:
+            return v
+    for lab in labels:
+        v = get_value_before_label(text, lab)
+        if v:
+            return v
+    return ""
+
+def slice_between(text: str, start_kw: str, end_kw: str) -> str:
+    s = text.find(start_kw)
+    if s == -1:
+        return ""
+    e = text.find(end_kw, s + len(start_kw))
+    if e == -1:
+        return text[s:]
+    return text[s:e]
+
+def normalize_mobile_from_line(line: str) -> str:
+    """
+    يدعم:
+    - 966 0550xxxxxx
+    - 96605xxxxxx => 9665xxxxxx
+    - 0590xxxxxx 966 (زي ملفات قوى)
+    الناتج: رقم متصل بدون مسافات
+    """
+    if not line:
+        return ""
+    groups = re.findall(r"\d+", line)
     if not groups:
         return ""
 
+    # هل يوجد كود الدولة؟
     has_966 = any(g == "966" or g.startswith("966") for g in groups)
 
-    local = None
+    # استخرج الرقم المحلي (05xxxxxxxx أو 5xxxxxxxx)
+    local = ""
     for g in groups:
         if len(g) == 10 and g.startswith("05"):
             local = g
@@ -86,231 +132,159 @@ def normalize_mobile(text: str) -> str:
             break
 
     if has_966 and local:
-        return "966" + local[1:]  # drop 0 after 966
+        return "966" + local[1:]  # احذف 0 بعد 966
 
-    if raw_no_spaces.startswith("9660"):
-        raw_no_spaces = "966" + raw_no_spaces[4:]
+    # أحيانًا يكون كله متصل مثل 9660xxxxxxxx
+    joined = "".join(groups)
+    if joined.startswith("9660"):
+        joined = "966" + joined[4:]
+    return joined
 
-    return digits_only(raw_no_spaces)
-
-def fix_rtl(s: str) -> str:
-    if not s:
-        return ""
-    s = s.strip()
-    if "@" in s or "SA" in s or re.fullmatch(r"[0-9\-/]+", s):
-        return s
-    ar = len(ARABIC_RE.findall(s))
-    la = len(LATIN_RE.findall(s))
-    if ar > la and ar >= 3:
-        return s[::-1]
-    return s
-
-def find_field(patterns, text, flags=re.MULTILINE | re.IGNORECASE):
-    for pat in patterns:
-        m = re.search(pat, text, flags)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-def find_before_label(label, text):
-    m = re.search(rf"([^\n:]+)\s*:\s*{label}", text)
-    return m.group(1).strip() if m else ""
-
-def find_after_label(label, text):
-    m = re.search(rf"{label}\s*:\s*([^\n]+)", text)
-    return m.group(1).strip() if m else ""
-
-def get_bi(label_std_patterns, label_rev_patterns, text):
-    for lab in label_std_patterns:
-        v = find_after_label(lab, text)
-        if v:
-            return v
-    for lab in label_rev_patterns:
-        v = find_before_label(lab, text)
-        if v:
-            return v
-    return ""
-
-def first_number(line: str) -> str:
-    m = re.search(r"([0-9][0-9,\.]*)", line)
-    return m.group(1) if m else ""
-
-def parse_amount_by_keywords(text: str, keywords):
+def find_line_containing(text: str, keyword: str) -> str:
     for ln in text.splitlines():
-        if all(k in ln for k in keywords):
-            num = first_number(ln)
-            if num:
-                return clean_amount(num)
+        if keyword in ln:
+            return ln.strip()
     return ""
 
+# ========= Strong Parser for Qiwa-style contracts =========
 def parse_contract(text: str) -> dict:
-    # Party 1
-    contract_no = find_field([
-        r"رقم العقد:\s*([0-9]+)",
-        r"([0-9]+)\s*:\s*دقعلا\s*مقر",
-        r"ID\s*Contract\s*[:\-]?\s*([0-9]+)",
-    ], text)
+    out = {h: "" for h in HEADERS}
+    if not text:
+        return out
 
-    contract_date = format_date(find_field([
-        r"في يوم.*?\(?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\s*\)?",
-        r"\(\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\s*\)",
-        r"on\s*\(?([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})\)?",
-    ], text))
+    # ---- Sections (stronger email split) ----
+    sec_first  = slice_between(text, "الطرف الأول", "الطرف الثاني")
+    sec_second = slice_between(text, "الطرف الثاني", "اتفق الطرفان")
 
-    company = fix_rtl(get_bi(["شركة/مؤسسة","Corporation/Company"], ["ةسسؤم/ةكرش"], text).split("\n")[0].strip(" :"))
-    nun     = get_bi(["الرقم الوطني الموحد","National Unified Number"], ["دحوملا ينطولا مقرلا"], text)
-    estab   = get_bi(["رقم المنشأة","Establishment Number"], ["ةأشنملا مقر"], text)
-    cr      = get_bi(["السجل التجاري","Commercial Registration"], ["يراجتلا لجسلا"], text)
-    address = fix_rtl(get_bi(["العنوان","Address"], ["ناونعلا"], text).split("\n")[0].strip(" :"))
-    workloc = fix_rtl(get_bi(["مكان العمل","Work Location"], ["لمعلا ناكم"], text).split("\n")[0].strip(" :"))
-
-    emails = EMAIL_RE.findall(text)
-    comp_email = emails[0] if emails else ""
-
-    signatory = fix_rtl(find_field([
-        r"ويمثلها بالتوقيع:\s*([^\n]+)",
-        r"([^\n:]+)\s*:\s*عيقوتلاب اهلثميو",
-    ], text))
-
-    position  = fix_rtl(find_field([
-        r"بصفته\s*([^\n]+)",
-        r"([^\n]+)\s*هتفصب",
-    ], text).split("\n")[0].strip(" :"))
-
-    # Party 2
-    m = re.search(r"Name:\s*([^\n]+)", text, re.IGNORECASE)
-    emp_name = m.group(1).strip() if m else get_bi(["الاسم","االسم"], ["مسلاا"], text).split("\n")[0].strip(" :")
-    emp_name = fix_rtl(emp_name.replace(":مسلاا","").strip())
-
-    emp_id = digits_only(get_bi(["رقم الهوية","Identity Number"], ["ةيوهلا مقر"], text))
-    id_type = fix_rtl(get_bi(["نوع الهوية","ID Type"], ["ةيوهلا عون"], text).split("\n")[0].strip(" :"))
-
-    dob   = format_date(get_bi(["تاريخ الميالد","Date of Birth"], ["دلايملا خيرات"], text))
-    idexp = format_date(get_bi(["تاريخ اإلنتهاء","تاريخ الانتهاء","ID Expiry Date"], ["ءاهتنلإا خيرات"], text))
-
-    nationality = fix_rtl(get_bi(["الجنسية","Nationality"], ["ةيسنجلا"], text).split("\n")[0].strip(" :"))
-    gender      = fix_rtl(get_bi(["الجنس","Gender"], ["سنجلا"], text).split("\n")[0].strip(" :"))
-    religion    = fix_rtl(get_bi(["الديانة","Religion"], ["ةنايدلا"], text).split("\n")[0].strip(" :"))
-    marital     = fix_rtl(get_bi(["الحالة االجتماعية","Marital Status"], ["ةيعامتجلاa ةلاحلا","ةيعامتجلاا ةلاحلا"], text).split("\n")[0].strip(" :"))
-    education   = fix_rtl(get_bi(["المؤهل العلمي","Education"], ["يملاعلا لهؤملا"], text).split("\n")[0].strip(" :"))
-    speciality  = fix_rtl(get_bi(["التخصص","Speciality"], ["صصختلا"], text).split("\n")[0].strip(" :"))
-
-    profession  = fix_rtl(get_bi(["المهنة","Profession"], ["ةنهملا"], text).split("\n")[0].strip(" :"))
-    emp_no      = digits_only(get_bi(["الرقم الوظيفي","Employee Number"], ["يفيظولا مقرلا"], text))
-
-    iban = get_bi(["رقم اآليبان","Iban"], ["نابيلآا مقر"], text)
-    iban = re.sub(r"\s+", "", iban).replace("null","").strip()
-
-    bank = fix_rtl(get_bi(["اسم البنك","Bank Name"], ["كنبلا مسا"], text).split("\n")[0].strip(" :"))
-
-    emp_email = ""
-    m = re.search(r"(?:الطرف الثاني|SECOND PARTY|يناثلا فرطلا).*?(" + EMAIL_RE.pattern + r")", text, re.IGNORECASE|re.DOTALL)
+    # ---- Contract number/date ----
+    m = re.search(r"رقم العقد\s*:\s*(\d+)", text)
     if m:
-        emp_email = m.group(1)
-    elif len(emails) >= 2:
-        emp_email = emails[1]
+        out["رقم العقد"] = m.group(1)
 
-    mobile = normalize_mobile(get_bi(["رقم الجوال","Mobile Number"], ["لاوجلا مقر"], text))
+    # يوم )2024-09-21( أو (2024-09-21)
+    m = re.search(r"في يوم\s*\)?\(?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\s*\)?", text)
+    if m:
+        out["تاريخ العقد"] = format_date_any(m.group(1))
 
-    # Terms
-    duration = find_field([
-        r"مدة هذا العقد\s*([0-9]+)\s*سنة",
-        r"دقعلا اذه ةدم\s*([0-9]+)\s*ةنس",
-        r"The contract[’']?s duration is\s*([0-9]+)\s*year",
-    ], text)
-    if not duration:
-        duration = find_field([
-            r"مدة هذا العقد\s*([0-9]+)\s*شهر",
-            r"دقعلا اذه ةدم\s*([0-9]+)\s*رهش",
-            r"duration is\s*([0-9]+)\s*month",
-        ], text)
+    # ---- First party fields ----
+    out["شركة/مؤسسة"] = get_bi(text, ["شركة/مؤسسة", "Corporation/Company"])
+    out["الرقم الوطني الموحد"] = get_bi(text, ["الرقم الوطني الموحد", "National Unified Number"])
+    out["رقم المنشأة"] = get_bi(text, ["رقم المنشأة", "Establishment Number"])
+    out["السجل التجاري"] = get_bi(text, ["السجل التجاري", "Commercial Registration"])
+    out["عنوان الشركة"] = get_bi(text, ["العنوان", "Address"])
+    out["مكان العمل"] = get_bi(text, ["مكان العمل", "Work Location"])
 
-    start = format_date(find_field([
-        r"يبدأ من تاريخ\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})",
-        r"starting from\s*([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})",
-    ], text))
+    # بريد الشركة (من قسم الطرف الأول)
+    if sec_first:
+        ems = EMAIL_RE.findall(sec_first)
+        if ems:
+            out["بريد الشركة"] = ems[0]
 
-    end = format_date(find_field([
-        r"وينتهي في\s*,?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})",
-        r"ends in\s*([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})",
-    ], text))
+    # المسؤول الموقع + الصفة
+    m = re.search(r"ويمثلها بالتوقيع\s*:\s*([^\n]+)", text)
+    if m:
+        line = m.group(1).strip()
+        # مثال: عبدالرحمن ... بصفته مدير الموارد البشرية
+        if "بصفته" in line:
+            left, right = line.split("بصفته", 1)
+            out["المسؤول الموقع"] = left.strip()
+            out["الصفة"] = right.strip()
+        else:
+            out["المسؤول الموقع"] = line
 
-    join = format_date(find_field([
-        r"تاريخ مباشرة.*?هو\s*\.?([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})",
-        r"joining date.*?is\s*([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})",
-    ], text, flags=re.IGNORECASE | re.DOTALL))
+    # ---- Second party fields ----
+    # الاسم في ملفات قوى يأتي: NAME :االسم
+    name = get_value_before_label(text, "االسم") or get_value_after_label(text, "االسم") or get_value_after_label(text, "Name")
+    out["اسم الموظف"] = name
 
-    trial = find_field([
-        r"فترة تجربة مدتها\s*([0-9]+)\s*يوم",
-        r"ةبرجت\s*ةرتف\s*اهتدم\s*([0-9]+)\s*موي",
-        r"trial period of\s*([0-9]+)\s*days",
-    ], text)
+    out["المهنة"] = get_bi(text, ["المهنة", "Profession"])
+    out["الرقم الوظيفي"] = digits_only(get_bi(text, ["الرقم الوظيفي", "Employee Number"]))
+    out["الجنسية"] = get_bi(text, ["الجنسية", "Nationality"])
+    out["تاريخ الميلاد"] = format_date_any(get_bi(text, ["تاريخ الميالد", "Date of Birth"]))
+    out["رقم الهوية"] = digits_only(get_bi(text, ["رقم الهوية", "Identity Number"]))
+    out["نوع الهوية"] = get_bi(text, ["نوع الهوية", "ID Type"])
+    out["تاريخ انتهاء الهوية"] = format_date_any(get_bi(text, ["تاريخ اإلنتهاء", "تاريخ الانتهاء", "ID Expiry Date"]))
+    out["الجنس"] = get_bi(text, ["الجنس", "Gender"])
+    out["الديانة"] = get_bi(text, ["الديانة", "Religion"])
+    out["الحالة الاجتماعية"] = get_bi(text, ["الحالة االجتماعية", "الحالة الاجتماعية", "Marital Status"])
+    out["المؤهل العلمي"] = get_bi(text, ["المؤهل العلمي", "Education"])
+    out["التخصص"] = get_bi(text, ["التخصص", "Speciality"])
 
-    work_days  = find_field([r"أيام العمل العادية بـ\s*([0-9]+)", r"days per week.*?([0-9]+)"], text)
-    work_hours = find_field([r"ساعات العمل بـ\s*([0-9]+)\s*يوميًا", r"daily hours.*?([0-9]+)"], text)
+    # IBAN / Bank
+    iban = get_bi(text, ["رقم اآليبان", "رقم الآيبان", "Iban"])
+    out["رقم الآيبان"] = re.sub(r"\s+", "", iban).strip()
+    out["اسم البنك"] = get_bi(text, ["اسم البنك", "Bank Name"])
 
-    overtime = find_field([
-        r"٪\s*([0-9]+)\s*من أجره األساسي",
-        r"plus\s*([0-9]+)\%",
-    ], text)
+    # بريد الموظف (من قسم الطرف الثاني)
+    if sec_second:
+        ems2 = EMAIL_RE.findall(sec_second)
+        if ems2:
+            out["بريد الموظف"] = ems2[0]
 
-    # amounts by lines
-    basic_salary = parse_amount_by_keywords(text, ["يساسأ", "لاير"]) or parse_amount_by_keywords(text, ["أجر", "أساسي"])
-    housing      = parse_amount_by_keywords(text, ["نكس", "لاير"]) or parse_amount_by_keywords(text, ["بدل", "سكن"])
+    # جوال (خط خاص عشان صيغة "0590... 966")
+    mobile_line = find_line_containing(text, "رقم الجوال")
+    if mobile_line:
+        out["رقم الجوال"] = normalize_mobile_from_line(mobile_line)
 
-    annual_leave = find_field([
-        r"إجازة سنوية مدتها\s*([0-9]+)\s*يوم",
-        r"annual leave of\s*([0-9]+)\s*days",
-        r"ةيونس\s*ةزاجإ\s*ةدم\s*([0-9]+)\s*موي",
-    ], text)
+    # ---- Contract terms (مدة/بدء/انتهاء/مباشرة/تجربة) ----
+    # مدة هذا العقد 1 سنة / 6 شهر
+    m = re.search(r"مدة هذا العقد\s+(\d+)\s*(سنة|سنوات|شهر|أشهر)", text)
+    if m:
+        out["مدة العقد"] = m.group(1)
 
-    termination = parse_amount_by_keywords(text, ["تعويض", "لاير"]) or parse_amount_by_keywords(text, ["ضيوعت", "لاير"])
-    if not termination:
-        m = re.search(r"(?:تعويض|ضيوعت)[^0-9]{0,80}([0-9][0-9\.,]+)", text)
-        if m:
-            termination = clean_amount(m.group(1))
+    # يبدأ من تاريخ YYYY-MM-DD وينتهي في ,YYYY-MM-DD
+    m = re.search(r"يبدأ من تاريخ\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2}).*?وينتهي في\s*[,،]?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})", text)
+    if m:
+        out["بدء العقد"] = format_date_any(m.group(1))
+        out["انتهاء العقد"] = format_date_any(m.group(2))
 
-    return {
-        "رقم العقد": contract_no,
-        "تاريخ العقد": contract_date,
-        "شركة/مؤسسة": company,
-        "الرقم الوطني الموحد": nun,
-        "رقم المنشأة": estab,
-        "السجل التجاري": cr,
-        "عنوان الشركة": address,
-        "مكان العمل": workloc,
-        "بريد الشركة": comp_email,
-        "المسؤول الموقع": signatory,
-        "الصفة": position,
+    # تاريخ مباشرة ... هو .YYYY-MM-DD
+    m = re.search(r"تاريخ مباشرة.*?هو\s*[\.،,]?\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})", text)
+    if m:
+        out["تاريخ المباشرة الفعلية"] = format_date_any(m.group(1))
 
-        "اسم الموظف": emp_name,
-        "رقم الهوية": emp_id,
-        "نوع الهوية": id_type,
-        "تاريخ الميلاد": dob,
-        "تاريخ انتهاء الهوية": idexp,
-        "الجنسية": nationality,
-        "الجنس": gender,
-        "الديانة": religion,
-        "الحالة الاجتماعية": marital,
-        "المؤهل العلمي": education,
-        "التخصص": speciality,
-        "المهنة": profession,
-        "الرقم الوظيفي": emp_no,
-        "رقم الآيبان": iban,
-        "اسم البنك": bank,
-        "بريد الموظف": emp_email,
-        "رقم الجوال": mobile,
+    # فترة تجربة مدتها 90 يومًا
+    m = re.search(r"فترة تجربة مدتها\s*(\d+)\s*يوم", text)
+    if m:
+        out["فترة التجربة"] = m.group(1)
 
-        "بدء العقد": start,
-        "انتهاء العقد": end,
-        "تاريخ المباشرة الفعلية": join,
-        "مدة العقد": digits_only(duration),
-        "فترة التجربة": digits_only(trial),
-        "أيام العمل الأسبوعية": digits_only(work_days),
-        "ساعات العمل اليومية": digits_only(work_hours),
-        "الراتب الأساسي": digits_only(basic_salary),
-        "بدل السكن": digits_only(housing),
-        "الإجازة السنوية": digits_only(annual_leave),
-        "أجر الساعة الإضافية": digits_only(overtime),
-        "التعويض عند الفسخ بدون سبب": digits_only(termination),
-    }
+    # أيام/ساعات
+    m = re.search(r"تحدد أيام العمل العادية بـ\s*(\d+)\s*أيام", text)
+    if m:
+        out["أيام العمل الأسبوعية"] = m.group(1)
+
+    m = re.search(r"تحدد ساعات العمل بـ\s*(\d+)\s*يومي", text)
+    if m:
+        out["ساعات العمل اليومية"] = m.group(1)
+
+    # أجر الساعة الإضافية %50
+    m = re.search(r"مضافًا إليه\s*٪\s*(\d+)", text)
+    if m:
+        out["أجر الساعة الإضافية"] = m.group(1)
+
+    # ---- Money fields ----
+    # الراتب الأساسي: "أجرًا أساسي قدره 2,000.00 ريال سعودي"
+    m = re.search(r"أجرًا\s*أساسي\s*قدره\s*([0-9][0-9,]*(?:\.[0-9]+)?)", text)
+    if m:
+        out["الراتب الأساسي"] = clean_amount_to_int(m.group(1))
+
+    # بدل السكن: "أجر 500.00 ريال سعودي, بدل سكن"
+    m = re.search(r"أجر\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*ريال\s*سعودي\s*[,،]?\s*بدل\s*سكن", text)
+    if m:
+        out["بدل السكن"] = clean_amount_to_int(m.group(1))
+
+    # الإجازة السنوية: "إجازة سنوية مدتها 21 يومًا"
+    m = re.search(r"إجازة\s*سنوية\s*مدتها\s*(\d+)\s*يوم", text)
+    if m:
+        out["الإجازة السنوية"] = m.group(1)
+
+    # التعويض: "تعويضًا ... قدره 2,500.00 ريال سعودي"
+    m = re.search(r"تعويضًا.*?قدره\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*ريال\s*سعودي", text)
+    if m:
+        out["التعويض عند الفسخ بدون سبب"] = clean_amount_to_int(m.group(1))
+
+    # تنظيف نهائي (أي None -> "")
+    for k, v in list(out.items()):
+        out[k] = "" if v is None else str(v).strip()
+
+    return out
